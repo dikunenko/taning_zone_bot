@@ -1,3 +1,4 @@
+
 import json
 import os
 import re
@@ -5,28 +6,26 @@ import sqlite3
 import traceback
 from datetime import datetime, date
 from typing import Dict, Any, Optional, List
-from openai import OpenAI
 
 import requests
+from openai import OpenAI
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ParseMode
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
 
-# ==================== КОНФИГУРАЦИЯ ====================
-ADMIN_USER_ID = 365244826  # ЗАМЕНИТЕ НА ВАШ TELEGRAM USER ID
+ADMIN_USER_ID = 123456789
 
 
-# ==================== ЛОГГЕР ====================
 class DebugLogger:
-    def __init__(self, bot=None, admin_id=None):
+    def __init__(self, bot=None, admin_id=None, db=None):
         self.bot = bot
         self.admin_id = admin_id
+        self.db = db
         self.logs = []
 
     def send_log(self, message: str, message_type: str = "info"):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         emoji = {
             "info": "📘",
             "success": "✅",
@@ -40,6 +39,12 @@ class DebugLogger:
         short_message = f"[{timestamp}] {message}"
         self.logs.append(short_message)
         print(short_message)
+
+        if self.db:
+            try:
+                self.db.save_bot_log(short_message, message_type)
+            except Exception as e:
+                print(f"Не удалось сохранить лог в БД: {e}")
 
         if self.bot and self.admin_id:
             text = f"{emoji} [{timestamp}]\n{message}"
@@ -61,41 +66,6 @@ class DebugLogger:
 
 
 debug_logger = DebugLogger()
-
-
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
-def safe_json_loads(text: str) -> Dict[str, Any]:
-    text = text.strip()
-
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    fenced_json = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
-    if fenced_json:
-        try:
-            return json.loads(fenced_json.group(1))
-        except Exception:
-            pass
-
-    fenced_any = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
-    if fenced_any:
-        try:
-            return json.loads(fenced_any.group(1))
-        except Exception:
-            pass
-
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = text[start:end + 1]
-        try:
-            return json.loads(candidate)
-        except Exception:
-            pass
-
-    raise ValueError(f"Не удалось распарсить JSON из ответа модели: {text[:500]}")
 
 
 def today_iso() -> str:
@@ -120,7 +90,6 @@ def to_int_or_none(v):
         return None
 
 
-# ==================== БАЗА ДАННЫХ ====================
 class Database:
     def __init__(self, db_name: str = "training_zone.db"):
         self.db_name = db_name
@@ -281,7 +250,6 @@ class Database:
 
         conn.commit()
         conn.close()
-
         debug_logger.send_log("База данных инициализирована", "database")
 
     def save_bot_log(self, log_text: str, log_type: str = "info"):
@@ -296,6 +264,22 @@ class Database:
             conn.close()
         except Exception:
             pass
+
+    def get_recent_logs(self, limit: int = 20) -> List[Dict[str, Any]]:
+        conn = self.get_conn()
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT id, log_text, log_type, timestamp
+            FROM bot_logs
+            ORDER BY id DESC
+            LIMIT ?
+        ''', (limit,))
+        rows = cur.fetchall()
+        conn.close()
+        return [
+            {"id": r[0], "log_text": r[1], "log_type": r[2], "timestamp": r[3]}
+            for r in rows
+        ]
 
     def add_user(self, user_id: int, username: str = None, first_name: str = None):
         conn = self.get_conn()
@@ -680,16 +664,10 @@ class Database:
         return data[0] if data else None
 
 
-# ==================== AI КЛИЕНТЫ ====================
 class AIClients:
     def __init__(self):
-        # =========================
-        # VSELLM / OpenAI-compatible
-        # =========================
         self.vsellm_api_key = os.getenv("VSELLM_API_KEY")
         self.vsellm_base_url = os.getenv("VSELLM_BASE_URL", "https://api.vsellm.ru/v1")
-
-        # Разные модели под разные задачи
         self.vsellm_chat_model = os.getenv("VSELLM_CHAT_MODEL", "openai/gpt-5-nano")
         self.vsellm_primary_model = os.getenv("VSELLM_PRIMARY_MODEL", self.vsellm_chat_model)
         self.vsellm_validator_model = os.getenv("VSELLM_VALIDATOR_MODEL", self.vsellm_chat_model)
@@ -701,9 +679,6 @@ class AIClients:
                 base_url=self.vsellm_base_url
             )
 
-        # =========================
-        # Yandex fallback
-        # =========================
         self.yandex_api_key = os.getenv('YANDEX_API_KEY')
         self.yandex_folder_id = os.getenv('YANDEX_FOLDER_ID')
         self.yandex_url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
@@ -719,13 +694,7 @@ class AIClients:
             "api"
         )
 
-    # =========================
-    # PUBLIC API
-    # =========================
     def call_api(self, user_message: str, system_prompt: str, temperature: float = 0.3, max_tokens: int = 1200) -> str:
-        """
-        Обычный текстовый вызов модели для ответов тренера.
-        """
         last_error = None
 
         if self.use_vsellm:
@@ -753,10 +722,6 @@ class AIClients:
         raise RuntimeError(f"Нет доступного AI провайдера или все вызовы упали: {last_error}")
 
     def call_json_api(self, user_message: str, system_prompt: str, temperature: float = 0.1, max_tokens: int = 1400) -> Dict[str, Any]:
-        """
-        JSON вызов без разделения ролей.
-        По умолчанию использует primary model.
-        """
         return self.call_json_api_with_role(
             role_type="primary",
             user_message=user_message,
@@ -773,11 +738,6 @@ class AIClients:
         temperature: float = 0.1,
         max_tokens: int = 1400
     ) -> Dict[str, Any]:
-        """
-        JSON вызов с выбором модели:
-        - role_type="primary"
-        - role_type="validator"
-        """
         if role_type not in ("primary", "validator"):
             raise ValueError("role_type должен быть 'primary' или 'validator'")
 
@@ -795,7 +755,6 @@ class AIClients:
             "Если не уверен — всё равно верни максимально корректный JSON по заданной схеме."
         )
 
-        # ======== Основные попытки через VSELLM ========
         if self.use_vsellm:
             for attempt in range(3):
                 try:
@@ -817,8 +776,6 @@ class AIClients:
                 except Exception as e:
                     last_error = e
                     debug_logger.log_error(e, f"VSELLM JSON call role={role_type} attempt {attempt + 1}/3")
-
-                    # усиливаем инструкцию на следующей попытке
                     current_user_message = (
                         f"{user_message}\n\n"
                         "ВАЖНО: ответь только валидным JSON-объектом. "
@@ -830,7 +787,6 @@ class AIClients:
                         "Если ответ не будет JSON, это будет считаться ошибкой."
                     )
 
-        # ======== Fallback: просим обычный текст и пытаемся вытащить JSON ========
         if self.use_vsellm:
             try:
                 debug_logger.send_log(
@@ -860,7 +816,6 @@ class AIClients:
                 last_error = e
                 debug_logger.log_error(e, f"Soft JSON fallback failed role={role_type}")
 
-        # ======== Fallback на Yandex ========
         if self.use_yandex:
             try:
                 debug_logger.send_log(f"Fallback to YandexGPT for JSON role={role_type}", "warning")
@@ -885,9 +840,6 @@ class AIClients:
 
         raise RuntimeError(f"Не удалось получить валидный JSON от модели. Последняя ошибка: {last_error}")
 
-    # =========================
-    # VSELLM LOW LEVEL
-    # =========================
     def _call_vsellm_with_model(
         self,
         model: str,
@@ -915,7 +867,6 @@ class AIClients:
             max_tokens=max_tokens
         )
 
-        # Логируем raw response
         try:
             dump = response.model_dump()
             debug_logger.send_log(
@@ -937,25 +888,21 @@ class AIClients:
         if content is None:
             raise RuntimeError("VSELLM вернул пустой content (None)")
 
-        # Нормальный текст
         if isinstance(content, str):
             content = content.strip()
             if not content:
                 raise RuntimeError("VSELLM вернул пустую строку в content")
             return content
 
-        # Иногда content бывает списком блоков
         if isinstance(content, list):
             parts = []
             for item in content:
-                # dict-like
                 if isinstance(item, dict):
                     if item.get("type") == "text" and item.get("text"):
                         parts.append(str(item["text"]))
                     elif item.get("text"):
                         parts.append(str(item["text"]))
                 else:
-                    # object-like
                     item_text = getattr(item, "text", None)
                     if item_text:
                         parts.append(str(item_text))
@@ -965,15 +912,11 @@ class AIClients:
                 raise RuntimeError("VSELLM вернул content как list, но без текстовых частей")
             return final_text
 
-        # fallback
         content_str = str(content).strip()
         if not content_str:
             raise RuntimeError("VSELLM вернул content неизвестного типа, который пуст после str()")
         return content_str
 
-    # =========================
-    # JSON PARSER
-    # =========================
     def _safe_json_loads(self, text: str) -> Dict[str, Any]:
         if text is None:
             raise ValueError("Ответ модели равен None")
@@ -986,13 +929,11 @@ class AIClients:
         if not text:
             raise ValueError("Ответ модели пустой")
 
-        # 1. Прямая попытка
         try:
             return json.loads(text)
         except Exception:
             pass
 
-        # 2. ```json ... ```
         fenced_json = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
         if fenced_json:
             try:
@@ -1000,7 +941,6 @@ class AIClients:
             except Exception:
                 pass
 
-        # 3. ``` ... ```
         fenced_any = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
         if fenced_any:
             try:
@@ -1008,7 +948,6 @@ class AIClients:
             except Exception:
                 pass
 
-        # 4. Вырезать первый JSON-объект
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end != -1 and end > start:
@@ -1020,9 +959,6 @@ class AIClients:
 
         raise ValueError(f"Не удалось распарсить JSON из ответа модели: {text[:800]}")
 
-    # =========================
-    # YANDEX FALLBACK
-    # =========================
     def call_yandexgpt(self, user_message: str, system_prompt: str, temperature: float = 0.2, max_tokens: int = 1200) -> str:
         headers = {
             "Authorization": f"Api-Key {self.yandex_api_key}",
@@ -1059,7 +995,7 @@ class AIClients:
 
         return str(text).strip()
 
-# ==================== ПАРСЕР ТРЕНИРОВОК ====================
+
 class TrainingParserService:
     def __init__(self, ai_clients: AIClients, db: Database):
         self.ai = ai_clients
@@ -1109,7 +1045,7 @@ class TrainingParserService:
 - только JSON.
 """
 
-        primary = self.ai.call_json_api(raw_text, parse_prompt)
+        primary = self.ai.call_json_api_with_role("primary", raw_text, parse_prompt)
 
         validate_prompt = f"""
 Ты — валидатор разбора тренировок.
@@ -1142,7 +1078,6 @@ class TrainingParserService:
 Распарсенный JSON:
 {json.dumps(primary, ensure_ascii=False)}
 """
-        primary = self.ai.call_json_api_with_role("primary", raw_text, parse_prompt)
         validator = self.ai.call_json_api_with_role("validator", "Проверь разбор тренировки", validate_prompt)
 
         is_valid = bool(validator.get("is_valid", False))
@@ -1162,8 +1097,8 @@ class TrainingParserService:
             user_id=user_id,
             raw_entry_id=raw_entry_id,
             entry_type="training",
-            model_primary="parser_model",
-            model_validator="validator_model",
+            model_primary=self.ai.vsellm_primary_model,
+            model_validator=self.ai.vsellm_validator_model,
             primary_output=primary,
             validator_output=validator,
             final_output=final_data,
@@ -1189,7 +1124,6 @@ class TrainingParserService:
         }
 
 
-# ==================== ПАРСЕР ПИТАНИЯ ====================
 class NutritionParserService:
     def __init__(self, ai_clients: AIClients, db: Database):
         self.ai = ai_clients
@@ -1234,7 +1168,7 @@ class NutritionParserService:
 - только JSON.
 """
 
-        primary = self.ai.call_json_api(raw_text, parse_prompt)
+        primary = self.ai.call_json_api_with_role("primary", raw_text, parse_prompt)
 
         validate_prompt = f"""
 Ты — валидатор разбора питания.
@@ -1266,7 +1200,6 @@ class NutritionParserService:
 Распарсенный JSON:
 {json.dumps(primary, ensure_ascii=False)}
 """
-        primary = self.ai.call_json_api_with_role("primary", raw_text, parse_prompt)
         validator = self.ai.call_json_api_with_role("validator", "Проверь разбор питания", validate_prompt)
 
         is_valid = bool(validator.get("is_valid", False))
@@ -1286,8 +1219,8 @@ class NutritionParserService:
             user_id=user_id,
             raw_entry_id=raw_entry_id,
             entry_type="nutrition",
-            model_primary="parser_model",
-            model_validator="validator_model",
+            model_primary=self.ai.vsellm_primary_model,
+            model_validator=self.ai.vsellm_validator_model,
             primary_output=primary,
             validator_output=validator,
             final_output=final_data,
@@ -1313,7 +1246,6 @@ class NutritionParserService:
         }
 
 
-# ==================== АНАЛИТИКА ====================
 class AnalyticsService:
     def __init__(self, db: Database):
         self.db = db
@@ -1405,7 +1337,6 @@ class AnalyticsService:
         return "\n".join(lines)
 
 
-# ==================== ТРЕНЕР ====================
 class TrainingZoneCoach:
     def __init__(self, ai_clients: AIClients, user_id: int, db: Database, analytics: AnalyticsService):
         self.ai_clients = ai_clients
@@ -1498,16 +1429,17 @@ class TrainingZoneCoach:
         return self.ai_clients.call_api(user_message, system_prompt, temperature=0.7, max_tokens=700)
 
 
-# ==================== TELEGRAM БОТ ====================
 class TrainingZoneBot:
     def __init__(self, token: str, admin_id: int):
         self.token = token
         self.admin_id = admin_id
 
         global debug_logger
-        debug_logger = DebugLogger(None, admin_id)
+        debug_logger = DebugLogger(None, admin_id, None)
 
         self.db = Database()
+        debug_logger.db = self.db
+
         self.ai_clients = AIClients()
         self.training_parser = TrainingParserService(self.ai_clients, self.db)
         self.nutrition_parser = NutritionParserService(self.ai_clients, self.db)
@@ -1552,6 +1484,7 @@ class TrainingZoneBot:
             "/today\n"
             "/report 7\n"
             "/analytics 30\n"
+            "/logs 20\n"
             "/help\n\n"
             "Или используй кнопки ниже."
         )
@@ -1566,7 +1499,8 @@ class TrainingZoneBot:
             "/food [описание] — записать еду\n"
             "/today — краткий отчёт за сегодня\n"
             "/report [days] — отчёт по дням, например /report 14\n"
-            "/analytics [days] — отчёт + совет тренера, например /analytics 30\n\n"
+            "/analytics [days] — отчёт + совет тренера, например /analytics 30\n"
+            "/logs [n] — последние логи, только для админа\n\n"
             "Примеры:\n"
             "/training Присед 100кг 5х5, жим 80кг 5х5, подтягивания 10,8,6\n"
             "/food Куриная грудка 200г, гречка 150г, овощи\n\n"
@@ -1614,6 +1548,40 @@ class TrainingZoneBot:
             final_text = report
 
         update.message.reply_text(final_text, reply_markup=self.get_reply_keyboard())
+
+    def logs_command(self, update: Update, context: CallbackContext):
+        user_id = update.effective_user.id
+        if user_id != self.admin_id:
+            update.message.reply_text("❌ У вас нет доступа к этой команде.")
+            return
+
+        limit = 20
+        if context.args:
+            try:
+                limit = max(1, min(100, int(context.args[0])))
+            except Exception:
+                pass
+
+        try:
+            logs = self.db.get_recent_logs(limit)
+            if not logs:
+                update.message.reply_text("Логи пусты.")
+                return
+
+            lines = [f"📜 Последние {len(logs)} логов:\n"]
+            for log in reversed(logs):
+                lines.append(f"[{log['timestamp']}] ({log['log_type']})\n{log['log_text']}")
+
+            text = "\n\n".join(lines)
+            if len(text) > 3900:
+                chunks = [text[i:i + 3900] for i in range(0, len(text), 3900)]
+                for chunk in chunks:
+                    update.message.reply_text(chunk)
+            else:
+                update.message.reply_text(text)
+        except Exception as e:
+            debug_logger.log_error(e, "logs_command")
+            update.message.reply_text("⚠️ Ошибка при получении логов.")
 
     def process_training_text(self, update: Update, training_text: str):
         user = update.effective_user
@@ -1735,7 +1703,6 @@ class TrainingZoneBot:
         text = (update.message.text or "").strip()
 
         self.db.add_user(user_id, user.username, user.first_name)
-
         debug_logger.send_log(f"Сообщение от @{user.username} ({user_id}): {text[:300]}", "user")
 
         if text == "🏋️ Записать тренировку":
@@ -1815,6 +1782,12 @@ class TrainingZoneBot:
         debug_logger.bot = updater.bot
 
         try:
+            me = updater.bot.get_me()
+            debug_logger.send_log(f"Telegram bot connected: @{me.username} ({me.id})", "success")
+        except Exception as e:
+            print(f"Не удалось получить get_me: {e}")
+
+        try:
             updater.bot.send_message(
                 chat_id=self.admin_id,
                 text="✅ Бот Тренировочная зона запущен.\nЛоги и ошибки будут приходить сюда."
@@ -1832,7 +1805,7 @@ class TrainingZoneBot:
         dp.add_handler(CommandHandler("today", self.today_command))
         dp.add_handler(CommandHandler("report", self.report_command))
         dp.add_handler(CommandHandler("analytics", self.analytics_command))
-
+        dp.add_handler(CommandHandler("logs", self.logs_command))
         dp.add_handler(MessageHandler(Filters.text & ~Filters.command, self.handle_message))
 
         debug_logger.send_log("Все обработчики зарегистрированы. Запускаю polling...", "info")
@@ -1841,7 +1814,6 @@ class TrainingZoneBot:
         updater.idle()
 
 
-# ==================== ЗАПУСК ====================
 if __name__ == "__main__":
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
