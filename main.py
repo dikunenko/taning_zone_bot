@@ -14,7 +14,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
 
-ADMIN_USER_ID = 123456789
+ADMIN_USER_ID = 365244826
 
 
 class DebugLogger:
