@@ -683,108 +683,87 @@ class Database:
 # ==================== AI КЛИЕНТЫ ====================
 class AIClients:
     def __init__(self):
-        self.vsellm_primary_model = os.getenv("VSELLM_PRIMARY_MODEL", "openai/gpt-5-nano")
-        self.vsellm_validator_model = os.getenv("VSELLM_VALIDATOR_MODEL", self.vsellm_primary_model)
-        # ===== VSELLM / OpenAI-compatible =====
+        # =========================
+        # VSELLM / OpenAI-compatible
+        # =========================
         self.vsellm_api_key = os.getenv("VSELLM_API_KEY")
         self.vsellm_base_url = os.getenv("VSELLM_BASE_URL", "https://api.vsellm.ru/v1")
-        self.vsellm_model = os.getenv("VSELLM_MODEL", "openai/gpt-5-nano")
-        self.vsellm_client = None
 
+        # Разные модели под разные задачи
+        self.vsellm_chat_model = os.getenv("VSELLM_CHAT_MODEL", "openai/gpt-5-nano")
+        self.vsellm_primary_model = os.getenv("VSELLM_PRIMARY_MODEL", self.vsellm_chat_model)
+        self.vsellm_validator_model = os.getenv("VSELLM_VALIDATOR_MODEL", self.vsellm_chat_model)
+
+        self.vsellm_client = None
         if self.vsellm_api_key:
             self.vsellm_client = OpenAI(
                 api_key=self.vsellm_api_key,
                 base_url=self.vsellm_base_url
             )
 
-        # ===== OpenRouter =====
-        self.deepseek_api_key = os.getenv('DEEPSEEK_API_KEY2') or os.getenv('OPENROUTER_API_KEY')
-        self.deepseek_url = "https://openrouter.ai/api/v1/chat/completions"
-        self.openrouter_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
-
-        # ===== Yandex =====
+        # =========================
+        # Yandex fallback
+        # =========================
         self.yandex_api_key = os.getenv('YANDEX_API_KEY')
         self.yandex_folder_id = os.getenv('YANDEX_FOLDER_ID')
         self.yandex_url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 
         self.use_vsellm = bool(self.vsellm_api_key)
-        self.use_deepseek = bool(self.deepseek_api_key)
         self.use_yandex = bool(self.yandex_api_key and self.yandex_folder_id)
 
         debug_logger.send_log(
-            "API инициализированы | "
-            f"VSELLM: {self.use_vsellm} ({self.vsellm_model}) | "
-            f"OpenRouter: {self.use_deepseek} ({self.openrouter_model}) | "
-            f"YandexGPT: {self.use_yandex}",
+            "AIClients initialized | "
+            f"VSELLM={self.use_vsellm} "
+            f"(chat={self.vsellm_chat_model}, primary={self.vsellm_primary_model}, validator={self.vsellm_validator_model}) | "
+            f"Yandex={self.use_yandex}",
             "api"
         )
-    def call_vsellm_with_model(
-        self,
-        model: str,
-        user_message: str,
-        system_prompt: str,
-        temperature: float = 0.2,
-        max_tokens: int = 1200
-    ) -> str:
-        if not self.vsellm_client:
-            raise RuntimeError("VSELLM клиент не инициализирован")
-    
-        response = self.vsellm_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
-    
-        return response.choices[0].message.content
-    def call_api(self, user_message: str, system_prompt: str, temperature: float = 0.2, max_tokens: int = 1200) -> str:
-        # 1. Сначала VSELLM
+
+    # =========================
+    # PUBLIC API
+    # =========================
+    def call_api(self, user_message: str, system_prompt: str, temperature: float = 0.3, max_tokens: int = 1200) -> str:
+        """
+        Обычный текстовый вызов модели для ответов тренера.
+        """
+        last_error = None
+
         if self.use_vsellm:
-            try:
-                return self.call_vsellm(user_message, system_prompt, temperature, max_tokens)
-            except Exception as e:
-                debug_logger.log_error(e, "VSELLM call")
-                if self.use_deepseek:
-                    debug_logger.send_log("Переход на OpenRouter как fallback", "warning")
-                elif self.use_yandex:
-                    debug_logger.send_log("Переход на YandexGPT как fallback", "warning")
-    
-        # 2. Потом OpenRouter
-        if self.use_deepseek:
-            try:
-                return self.call_deepseek(user_message, system_prompt, temperature, max_tokens)
-            except Exception as e:
-                debug_logger.log_error(e, "OpenRouter call")
-                if self.use_yandex:
-                    debug_logger.send_log("Переход на YandexGPT как fallback", "warning")
-    
-        # 3. Потом Yandex
+            for attempt in range(3):
+                try:
+                    return self._call_vsellm_with_model(
+                        model=self.vsellm_chat_model,
+                        user_message=user_message,
+                        system_prompt=system_prompt,
+                        temperature=temperature,
+                        max_tokens=max_tokens
+                    )
+                except Exception as e:
+                    last_error = e
+                    debug_logger.log_error(e, f"VSELLM chat call attempt {attempt + 1}/3")
+
         if self.use_yandex:
-            return self.call_yandexgpt(user_message, system_prompt, temperature, max_tokens)
-    
-        raise RuntimeError("Нет доступных API ключей для моделей")
-        
-    def call_vsellm(self, user_message: str, system_prompt: str, temperature: float = 0.2, max_tokens: int = 1200) -> str:
-        if not self.vsellm_client:
-            raise RuntimeError("VSELLM клиент не инициализирован")
-    
-        response = self.vsellm_client.chat.completions.create(
-            model=self.vsellm_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
-            ],
+            try:
+                debug_logger.send_log("Fallback to YandexGPT in call_api()", "warning")
+                return self.call_yandexgpt(user_message, system_prompt, temperature, max_tokens)
+            except Exception as e:
+                last_error = e
+                debug_logger.log_error(e, "Yandex fallback call_api")
+
+        raise RuntimeError(f"Нет доступного AI провайдера или все вызовы упали: {last_error}")
+
+    def call_json_api(self, user_message: str, system_prompt: str, temperature: float = 0.1, max_tokens: int = 1400) -> Dict[str, Any]:
+        """
+        JSON вызов без разделения ролей.
+        По умолчанию использует primary model.
+        """
+        return self.call_json_api_with_role(
+            role_type="primary",
+            user_message=user_message,
+            system_prompt=system_prompt,
             temperature=temperature,
             max_tokens=max_tokens
         )
-    
-        return response.choices[0].message.content
-    def call_json_api(self, user_message: str, system_prompt: str, temperature: float = 0.1, max_tokens: int = 1400) -> Dict[str, Any]:
-        text = self.call_api(user_message, system_prompt, temperature=temperature, max_tokens=max_tokens)
-        return safe_json_loads(text)
 
     def call_json_api_with_role(
         self,
@@ -794,38 +773,256 @@ class AIClients:
         temperature: float = 0.1,
         max_tokens: int = 1400
     ) -> Dict[str, Any]:
+        """
+        JSON вызов с выбором модели:
+        - role_type="primary"
+        - role_type="validator"
+        """
+        if role_type not in ("primary", "validator"):
+            raise ValueError("role_type должен быть 'primary' или 'validator'")
+
+        model = self.vsellm_primary_model if role_type == "primary" else self.vsellm_validator_model
+
+        last_error = None
+        current_user_message = user_message
+        current_system_prompt = system_prompt + (
+            "\n\n"
+            "КРИТИЧЕСКИ ВАЖНО:\n"
+            "Верни ТОЛЬКО валидный JSON.\n"
+            "Без markdown.\n"
+            "Без пояснений.\n"
+            "Без текста до и после JSON.\n"
+            "Если не уверен — всё равно верни максимально корректный JSON по заданной схеме."
+        )
+
+        # ======== Основные попытки через VSELLM ========
         if self.use_vsellm:
-            model = self.vsellm_primary_model if role_type == "primary" else self.vsellm_validator_model
-            text = self.call_vsellm_with_model(model, user_message, system_prompt, temperature, max_tokens)
-            return safe_json_loads(text)
+            for attempt in range(3):
+                try:
+                    text = self._call_vsellm_with_model(
+                        model=model,
+                        user_message=current_user_message,
+                        system_prompt=current_system_prompt,
+                        temperature=temperature,
+                        max_tokens=max_tokens
+                    )
 
-        text = self.call_api(user_message, system_prompt, temperature=temperature, max_tokens=max_tokens)
-        return safe_json_loads(text)
+                    debug_logger.send_log(
+                        f"RAW JSON RESPONSE | role={role_type} | attempt={attempt + 1} | model={model}\n{repr((text or '')[:1500])}",
+                        "api"
+                    )
 
-    def call_deepseek(self, user_message: str, system_prompt: str, temperature: float = 0.2, max_tokens: int = 1200) -> str:
-        headers = {
-            "Authorization": f"Bearer {self.deepseek_api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://t.me/TrainingZoneBot",
-            "X-Title": "Training Zone Coach"
-        }
+                    return self._safe_json_loads(text)
 
-        payload = {
-            "model": "deepseek/deepseek-chat:free",
-            "messages": [
+                except Exception as e:
+                    last_error = e
+                    debug_logger.log_error(e, f"VSELLM JSON call role={role_type} attempt {attempt + 1}/3")
+
+                    # усиливаем инструкцию на следующей попытке
+                    current_user_message = (
+                        f"{user_message}\n\n"
+                        "ВАЖНО: ответь только валидным JSON-объектом. "
+                        "Не используй markdown, комментарии, пояснения, префиксы и суффиксы."
+                    )
+                    current_system_prompt += (
+                        "\n\n"
+                        "Ещё раз: нужен только JSON-объект. "
+                        "Если ответ не будет JSON, это будет считаться ошибкой."
+                    )
+
+        # ======== Fallback: просим обычный текст и пытаемся вытащить JSON ========
+        if self.use_vsellm:
+            try:
+                debug_logger.send_log(
+                    f"Trying soft JSON fallback with chat model after JSON failures | role={role_type}",
+                    "warning"
+                )
+
+                fallback_text = self._call_vsellm_with_model(
+                    model=self.vsellm_chat_model,
+                    user_message=(
+                        f"{user_message}\n\n"
+                        "Ответь строго JSON-объектом без пояснений."
+                    ),
+                    system_prompt=current_system_prompt,
+                    temperature=0.0,
+                    max_tokens=max_tokens
+                )
+
+                debug_logger.send_log(
+                    f"RAW SOFT FALLBACK JSON RESPONSE | role={role_type}\n{repr((fallback_text or '')[:1500])}",
+                    "warning"
+                )
+
+                return self._safe_json_loads(fallback_text)
+
+            except Exception as e:
+                last_error = e
+                debug_logger.log_error(e, f"Soft JSON fallback failed role={role_type}")
+
+        # ======== Fallback на Yandex ========
+        if self.use_yandex:
+            try:
+                debug_logger.send_log(f"Fallback to YandexGPT for JSON role={role_type}", "warning")
+
+                yandex_text = self.call_yandexgpt(
+                    user_message=current_user_message,
+                    system_prompt=current_system_prompt,
+                    temperature=temperature,
+                    max_tokens=max_tokens
+                )
+
+                debug_logger.send_log(
+                    f"RAW YANDEX JSON RESPONSE | role={role_type}\n{repr((yandex_text or '')[:1500])}",
+                    "warning"
+                )
+
+                return self._safe_json_loads(yandex_text)
+
+            except Exception as e:
+                last_error = e
+                debug_logger.log_error(e, f"Yandex JSON fallback failed role={role_type}")
+
+        raise RuntimeError(f"Не удалось получить валидный JSON от модели. Последняя ошибка: {last_error}")
+
+    # =========================
+    # VSELLM LOW LEVEL
+    # =========================
+    def _call_vsellm_with_model(
+        self,
+        model: str,
+        user_message: str,
+        system_prompt: str,
+        temperature: float = 0.2,
+        max_tokens: int = 1200
+    ) -> str:
+        if not self.vsellm_client:
+            raise RuntimeError("VSELLM клиент не инициализирован")
+
+        debug_logger.send_log(
+            f"VSELLM request | model={model} | temp={temperature} | max_tokens={max_tokens} | "
+            f"user_message={repr(user_message[:300])}",
+            "api"
+        )
+
+        response = self.vsellm_client.chat.completions.create(
+            model=model,
+            messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message}
             ],
-            "temperature": temperature,
-            "max_tokens": max_tokens
-        }
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
 
-        response = requests.post(self.deepseek_url, json=payload, headers=headers, timeout=60)
-        if response.status_code != 200:
-            raise RuntimeError(f"DeepSeek/OpenRouter {response.status_code}: {response.text[:500]}")
-        result = response.json()
-        return result["choices"][0]["message"]["content"]
+        # Логируем raw response
+        try:
+            dump = response.model_dump()
+            debug_logger.send_log(
+                f"VSELLM raw response dump | model={model}\n{repr(str(dump)[:2500])}",
+                "api"
+            )
+        except Exception as e:
+            debug_logger.send_log(f"Не удалось сделать model_dump response: {e}", "warning")
 
+        if not hasattr(response, "choices") or not response.choices:
+            raise RuntimeError("VSELLM вернул пустой список choices")
+
+        choice = response.choices[0]
+        if not hasattr(choice, "message") or choice.message is None:
+            raise RuntimeError("VSELLM вернул choice без message")
+
+        content = getattr(choice.message, "content", None)
+
+        if content is None:
+            raise RuntimeError("VSELLM вернул пустой content (None)")
+
+        # Нормальный текст
+        if isinstance(content, str):
+            content = content.strip()
+            if not content:
+                raise RuntimeError("VSELLM вернул пустую строку в content")
+            return content
+
+        # Иногда content бывает списком блоков
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                # dict-like
+                if isinstance(item, dict):
+                    if item.get("type") == "text" and item.get("text"):
+                        parts.append(str(item["text"]))
+                    elif item.get("text"):
+                        parts.append(str(item["text"]))
+                else:
+                    # object-like
+                    item_text = getattr(item, "text", None)
+                    if item_text:
+                        parts.append(str(item_text))
+
+            final_text = "\n".join(p.strip() for p in parts if p and str(p).strip()).strip()
+            if not final_text:
+                raise RuntimeError("VSELLM вернул content как list, но без текстовых частей")
+            return final_text
+
+        # fallback
+        content_str = str(content).strip()
+        if not content_str:
+            raise RuntimeError("VSELLM вернул content неизвестного типа, который пуст после str()")
+        return content_str
+
+    # =========================
+    # JSON PARSER
+    # =========================
+    def _safe_json_loads(self, text: str) -> Dict[str, Any]:
+        if text is None:
+            raise ValueError("Ответ модели равен None")
+
+        if not isinstance(text, str):
+            text = str(text)
+
+        text = text.strip()
+
+        if not text:
+            raise ValueError("Ответ модели пустой")
+
+        # 1. Прямая попытка
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+
+        # 2. ```json ... ```
+        fenced_json = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+        if fenced_json:
+            try:
+                return json.loads(fenced_json.group(1))
+            except Exception:
+                pass
+
+        # 3. ``` ... ```
+        fenced_any = re.search(r"```\s*(.*?)\s*```", text, re.DOTALL)
+        if fenced_any:
+            try:
+                return json.loads(fenced_any.group(1))
+            except Exception:
+                pass
+
+        # 4. Вырезать первый JSON-объект
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            try:
+                return json.loads(candidate)
+            except Exception:
+                pass
+
+        raise ValueError(f"Не удалось распарсить JSON из ответа модели: {text[:800]}")
+
+    # =========================
+    # YANDEX FALLBACK
+    # =========================
     def call_yandexgpt(self, user_message: str, system_prompt: str, temperature: float = 0.2, max_tokens: int = 1200) -> str:
         headers = {
             "Authorization": f"Api-Key {self.yandex_api_key}",
@@ -846,11 +1043,21 @@ class AIClients:
         }
 
         response = requests.post(self.yandex_url, json=payload, headers=headers, timeout=60)
-        if response.status_code != 200:
-            raise RuntimeError(f"YandexGPT {response.status_code}: {response.text[:500]}")
-        result = response.json()
-        return result["result"]["alternatives"][0]["message"]["text"]
 
+        if response.status_code != 200:
+            raise RuntimeError(f"YandexGPT {response.status_code}: {response.text[:1000]}")
+
+        result = response.json()
+
+        try:
+            text = result["result"]["alternatives"][0]["message"]["text"]
+        except Exception:
+            raise RuntimeError(f"Неожиданный формат ответа YandexGPT: {result}")
+
+        if not text or not str(text).strip():
+            raise RuntimeError("YandexGPT вернул пустой ответ")
+
+        return str(text).strip()
 
 # ==================== ПАРСЕР ТРЕНИРОВОК ====================
 class TrainingParserService:
