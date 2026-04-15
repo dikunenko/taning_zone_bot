@@ -1,5 +1,7 @@
 # Основная библиотека для Telegram бота
-python-telegram-bot==20.7
+python-telegram-bot==13.15
+requests==2.31.0
+python-dotenv==1.0.1
 
 # Для HTTP запросов к API DeepSeek и YandexGPT
 requests==2.31.0
