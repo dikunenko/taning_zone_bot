@@ -13,7 +13,7 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, Callb
 
 
 # ==================== КОНФИГУРАЦИЯ ====================
-ADMIN_USER_ID = 123456789  # ЗАМЕНИТЕ НА ВАШ TELEGRAM USER ID
+ADMIN_USER_ID = 345244826  # ЗАМЕНИТЕ НА ВАШ TELEGRAM USER ID
 
 
 # ==================== ЛОГГЕР ====================
