@@ -5,6 +5,7 @@ import sqlite3
 import traceback
 from datetime import datetime, date
 from typing import Dict, Any, Optional, List
+from openai import OpenAI
 
 import requests
 
@@ -682,38 +683,122 @@ class Database:
 # ==================== AI КЛИЕНТЫ ====================
 class AIClients:
     def __init__(self):
+        self.vsellm_primary_model = os.getenv("VSELLM_PRIMARY_MODEL", "openai/gpt-5-nano")
+        self.vsellm_validator_model = os.getenv("VSELLM_VALIDATOR_MODEL", self.vsellm_primary_model)
+        # ===== VSELLM / OpenAI-compatible =====
+        self.vsellm_api_key = os.getenv("VSELLM_API_KEY")
+        self.vsellm_base_url = os.getenv("VSELLM_BASE_URL", "https://api.vsellm.ru/v1")
+        self.vsellm_model = os.getenv("VSELLM_MODEL", "openai/gpt-5-nano")
+        self.vsellm_client = None
+
+        if self.vsellm_api_key:
+            self.vsellm_client = OpenAI(
+                api_key=self.vsellm_api_key,
+                base_url=self.vsellm_base_url
+            )
+
+        # ===== OpenRouter =====
         self.deepseek_api_key = os.getenv('DEEPSEEK_API_KEY2') or os.getenv('OPENROUTER_API_KEY')
         self.deepseek_url = "https://openrouter.ai/api/v1/chat/completions"
+        self.openrouter_model = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
 
+        # ===== Yandex =====
         self.yandex_api_key = os.getenv('YANDEX_API_KEY')
         self.yandex_folder_id = os.getenv('YANDEX_FOLDER_ID')
         self.yandex_url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 
+        self.use_vsellm = bool(self.vsellm_api_key)
         self.use_deepseek = bool(self.deepseek_api_key)
         self.use_yandex = bool(self.yandex_api_key and self.yandex_folder_id)
 
         debug_logger.send_log(
-            f"API инициализированы | DeepSeek/OpenRouter: {self.use_deepseek} | YandexGPT: {self.use_yandex}",
+            "API инициализированы | "
+            f"VSELLM: {self.use_vsellm} ({self.vsellm_model}) | "
+            f"OpenRouter: {self.use_deepseek} ({self.openrouter_model}) | "
+            f"YandexGPT: {self.use_yandex}",
             "api"
         )
-
+    def call_vsellm_with_model(
+        self,
+        model: str,
+        user_message: str,
+        system_prompt: str,
+        temperature: float = 0.2,
+        max_tokens: int = 1200
+    ) -> str:
+        if not self.vsellm_client:
+            raise RuntimeError("VSELLM клиент не инициализирован")
+    
+        response = self.vsellm_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+    
+        return response.choices[0].message.content
     def call_api(self, user_message: str, system_prompt: str, temperature: float = 0.2, max_tokens: int = 1200) -> str:
+        # 1. Сначала VSELLM
+        if self.use_vsellm:
+            try:
+                return self.call_vsellm(user_message, system_prompt, temperature, max_tokens)
+            except Exception as e:
+                debug_logger.log_error(e, "VSELLM call")
+                if self.use_deepseek:
+                    debug_logger.send_log("Переход на OpenRouter как fallback", "warning")
+                elif self.use_yandex:
+                    debug_logger.send_log("Переход на YandexGPT как fallback", "warning")
+    
+        # 2. Потом OpenRouter
         if self.use_deepseek:
             try:
                 return self.call_deepseek(user_message, system_prompt, temperature, max_tokens)
             except Exception as e:
-                debug_logger.log_error(e, "DeepSeek/OpenRouter call")
+                debug_logger.log_error(e, "OpenRouter call")
                 if self.use_yandex:
                     debug_logger.send_log("Переход на YandexGPT как fallback", "warning")
-                    return self.call_yandexgpt(user_message, system_prompt, temperature, max_tokens)
-                raise
-
+    
+        # 3. Потом Yandex
         if self.use_yandex:
             return self.call_yandexgpt(user_message, system_prompt, temperature, max_tokens)
-
+    
         raise RuntimeError("Нет доступных API ключей для моделей")
-
+        
+    def call_vsellm(self, user_message: str, system_prompt: str, temperature: float = 0.2, max_tokens: int = 1200) -> str:
+        if not self.vsellm_client:
+            raise RuntimeError("VSELLM клиент не инициализирован")
+    
+        response = self.vsellm_client.chat.completions.create(
+            model=self.vsellm_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+    
+        return response.choices[0].message.content
     def call_json_api(self, user_message: str, system_prompt: str, temperature: float = 0.1, max_tokens: int = 1400) -> Dict[str, Any]:
+        text = self.call_api(user_message, system_prompt, temperature=temperature, max_tokens=max_tokens)
+        return safe_json_loads(text)
+
+    def call_json_api_with_role(
+        self,
+        role_type: str,
+        user_message: str,
+        system_prompt: str,
+        temperature: float = 0.1,
+        max_tokens: int = 1400
+    ) -> Dict[str, Any]:
+        if self.use_vsellm:
+            model = self.vsellm_primary_model if role_type == "primary" else self.vsellm_validator_model
+            text = self.call_vsellm_with_model(model, user_message, system_prompt, temperature, max_tokens)
+            return safe_json_loads(text)
+
         text = self.call_api(user_message, system_prompt, temperature=temperature, max_tokens=max_tokens)
         return safe_json_loads(text)
 
@@ -850,7 +935,8 @@ class TrainingParserService:
 Распарсенный JSON:
 {json.dumps(primary, ensure_ascii=False)}
 """
-        validator = self.ai.call_json_api("Проверь разбор тренировки", validate_prompt)
+        primary = self.ai.call_json_api_with_role("primary", raw_text, parse_prompt)
+        validator = self.ai.call_json_api_with_role("validator", "Проверь разбор тренировки", validate_prompt)
 
         is_valid = bool(validator.get("is_valid", False))
         confidence = float(validator.get("confidence", 0) or 0)
@@ -973,7 +1059,8 @@ class NutritionParserService:
 Распарсенный JSON:
 {json.dumps(primary, ensure_ascii=False)}
 """
-        validator = self.ai.call_json_api("Проверь разбор питания", validate_prompt)
+        primary = self.ai.call_json_api_with_role("primary", raw_text, parse_prompt)
+        validator = self.ai.call_json_api_with_role("validator", "Проверь разбор питания", validate_prompt)
 
         is_valid = bool(validator.get("is_valid", False))
         confidence = float(validator.get("confidence", 0) or 0)
