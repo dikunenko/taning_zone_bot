@@ -6,9 +6,9 @@ import os
 import sqlite3
 from typing import Dict, Any, Optional
 
-# Telegram imports
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
+# Telegram imports для версии 13.15
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ParseMode
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
 # ==================== БАЗА ДАННЫХ ====================
 class Database:
@@ -235,8 +235,8 @@ class TrainingZoneCoach:
         self.context = self.db.load_context(user_id)
         if not self.context:
             self.context = {
-                "trainer_personality": """Ты - тренер из 'Тренировочной зоны' в стиле Пола Уэйда, практикующий так же подход 5\3\1. 
-                Ты строгий, прямолинейный, мотивирующий тренер, который проповедует силовой тренинг без понтов, но и без лишнего панибратства.
+                "trainer_personality": """Ты - тренер из 'Тренировочной зоны' в стиле Пола Уэйда, но и практикующий тренинг 5\3\1.
+                Ты строгий, прямолинейный, мотивирующий тренер, который проповедует силовой тренинг без понтов, но и без панибратства, вежливо.
                 Ты не веришь в волшебные таблетки, только в тяжелую работу, дисциплину и правильное питание.
                 Твои ответы должны быть краткими, жесткими, но справедливыми. Ты ругаешь за лень, хвалишь за настоящие усилия.
                 Отвечай как опытный тренер, давай конкретные советы. Ответ должен быть 2-4 предложения.""",
@@ -327,7 +327,7 @@ class TrainingZoneBot:
             self.db.add_user(user_id)
         return self.coaches[user_id]
     
-    async def start(self, update: Update, context: CallbackContext):
+    def start(self, update: Update, context: CallbackContext):
         """Команда /start"""
         user = update.effective_user
         self.db.add_user(user.id, user.username, user.first_name)
@@ -355,15 +355,15 @@ class TrainingZoneBot:
 Погнали! Железо не ждет! 💪
         """
         
-        await update.message.reply_text(welcome_text, parse_mode='Markdown', reply_markup=reply_markup)
+        update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
     
-    async def handle_training(self, update: Update, context: CallbackContext):
+    def handle_training(self, update: Update, context: CallbackContext):
         """Обработчик команды /training"""
         if not context.args:
-            await update.message.reply_text(
+            update.message.reply_text(
                 "❌ Напиши тренировку после команды.\n"
                 "Пример: `/training Присел 100кг 5х5, жим 80кг 5х5`",
-                parse_mode='Markdown'
+                parse_mode=ParseMode.MARKDOWN
             )
             return
         
@@ -371,18 +371,18 @@ class TrainingZoneBot:
         user_id = update.effective_user.id
         coach = self.get_coach(user_id)
         
-        await update.message.reply_text("🏋️ Анализирую тренировку...")
+        update.message.reply_text("🏋️ Анализирую тренировку...")
         
         response = coach.process_training(training_text)
-        await update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode='Markdown')
+        update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode=ParseMode.MARKDOWN)
     
-    async def handle_food(self, update: Update, context: CallbackContext):
+    def handle_food(self, update: Update, context: CallbackContext):
         """Обработчик команды /food"""
         if not context.args:
-            await update.message.reply_text(
+            update.message.reply_text(
                 "❌ Напиши что съел после команды.\n"
                 "Пример: `/food Курица с гречкой и овощами`",
-                parse_mode='Markdown'
+                parse_mode=ParseMode.MARKDOWN
             )
             return
         
@@ -390,12 +390,12 @@ class TrainingZoneBot:
         user_id = update.effective_user.id
         coach = self.get_coach(user_id)
         
-        await update.message.reply_text("🍽️ Оцениваю твое питание...")
+        update.message.reply_text("🍽️ Оцениваю твое питание...")
         
         response = coach.process_nutrition(food_text)
-        await update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode='Markdown')
+        update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode=ParseMode.MARKDOWN)
     
-    async def handle_message(self, update: Update, context: CallbackContext):
+    def handle_message(self, update: Update, context: CallbackContext):
         """Обработчик обычных сообщений"""
         user_message = update.message.text
         user_id = update.effective_user.id
@@ -403,23 +403,23 @@ class TrainingZoneBot:
         
         # Обрабатываем кнопки меню
         if user_message == "🏋️ Записать тренировку":
-            await update.message.reply_text(
+            update.message.reply_text(
                 "✍️ Напиши свою тренировку в формате:\n"
                 "`Присел 100кг 5х5, жим лежа 80кг 5х5, подтягивания 10,8,6`",
-                parse_mode='Markdown'
+                parse_mode=ParseMode.MARKDOWN
             )
             return
         
         elif user_message == "🍽️ Записать еду":
-            await update.message.reply_text(
+            update.message.reply_text(
                 "✍️ Напиши что ты съел:\n"
                 "`Куриная грудка 200г, гречка 150г, салат овощной`",
-                parse_mode='Markdown'
+                parse_mode=ParseMode.MARKDOWN
             )
             return
         
         elif user_message == "❓ Задать вопрос тренеру":
-            await update.message.reply_text(
+            update.message.reply_text(
                 "💬 Задай свой вопрос. Я отвечу, учитывая твои тренировки и питание.\n\n"
                 "Примеры:\n"
                 "• Что мне сегодня съесть после тренировки?\n"
@@ -430,11 +430,11 @@ class TrainingZoneBot:
             return
         
         # Обычное сообщение - отправляем тренеру
-        await update.message.reply_text("🤔 Думаю...")
+        update.message.reply_text("🤔 Думаю...")
         response = coach.chat(user_message)
-        await update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode='Markdown')
+        update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode=ParseMode.MARKDOWN)
     
-    async def help_command(self, update: Update, context: CallbackContext):
+    def help_command(self, update: Update, context: CallbackContext):
         """Команда /help"""
         help_text = """
 📋 *Доступные команды:*
@@ -453,23 +453,25 @@ class TrainingZoneBot:
 
 Твои данные сохраняются, я помню всё! 💪
         """
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+        update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
     
     def run(self):
         """Запуск бота"""
-        app = Application.builder().token(self.token).build()
+        updater = Updater(self.token, use_context=True)
+        dp = updater.dispatcher
         
         # Команды
-        app.add_handler(CommandHandler("start", self.start))
-        app.add_handler(CommandHandler("help", self.help_command))
-        app.add_handler(CommandHandler("training", self.handle_training))
-        app.add_handler(CommandHandler("food", self.handle_food))
+        dp.add_handler(CommandHandler("start", self.start))
+        dp.add_handler(CommandHandler("help", self.help_command))
+        dp.add_handler(CommandHandler("training", self.handle_training))
+        dp.add_handler(CommandHandler("food", self.handle_food))
         
         # Обработчик всех сообщений
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        dp.add_handler(MessageHandler(Filters.text & ~Filters.command, self.handle_message))
         
         print("✅ Бот запущен!")
-        app.run_polling()
+        updater.start_polling()
+        updater.idle()
 
 # ==================== ЗАПУСК ====================
 if __name__ == "__main__":
