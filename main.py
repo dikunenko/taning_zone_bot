@@ -3,86 +3,175 @@ import requests
 import time
 from datetime import datetime
 import os
+import sqlite3
+from typing import Dict, Any, Optional
 
-# Для Telegram бота
-from telegram import Update, ParseMode
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+# Telegram imports
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
 
-# Инициализация клиентов API
+# ==================== БАЗА ДАННЫХ ====================
+class Database:
+    def __init__(self, db_name='training_zone.db'):
+        self.db_name = db_name
+        self.init_db()
+    
+    def init_db(self):
+        """Инициализация базы данных"""
+        conn = sqlite3.connect(self.db_name)
+        cur = conn.cursor()
+        
+        # Таблица пользователей
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Таблица тренировок
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS trainings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                training_text TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+        
+        # Таблица питания
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS nutrition (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                food_text TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+        
+        # Таблица контекста пользователя
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS user_context (
+                user_id INTEGER PRIMARY KEY,
+                context_json TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        print("✅ База данных готова")
+    
+    def add_user(self, user_id: int, username: str = None, first_name: str = None):
+        """Добавить пользователя"""
+        conn = sqlite3.connect(self.db_name)
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT OR IGNORE INTO users (user_id, username, first_name)
+            VALUES (?, ?, ?)
+        ''', (user_id, username, first_name))
+        conn.commit()
+        conn.close()
+    
+    def save_training(self, user_id: int, training_text: str):
+        """Сохранить тренировку"""
+        conn = sqlite3.connect(self.db_name)
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO trainings (user_id, training_text)
+            VALUES (?, ?)
+        ''', (user_id, training_text))
+        conn.commit()
+        conn.close()
+    
+    def save_nutrition(self, user_id: int, food_text: str):
+        """Сохранить прием пищи"""
+        conn = sqlite3.connect(self.db_name)
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO nutrition (user_id, food_text)
+            VALUES (?, ?)
+        ''', (user_id, food_text))
+        conn.commit()
+        conn.close()
+    
+    def get_recent_trainings(self, user_id: int, limit: int = 5) -> list:
+        """Получить последние тренировки"""
+        conn = sqlite3.connect(self.db_name)
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT training_text, timestamp FROM trainings 
+            WHERE user_id = ? 
+            ORDER BY timestamp DESC 
+            LIMIT ?
+        ''', (user_id, limit))
+        results = cur.fetchall()
+        conn.close()
+        return results
+    
+    def get_recent_nutrition(self, user_id: int, limit: int = 5) -> list:
+        """Получить последние записи о еде"""
+        conn = sqlite3.connect(self.db_name)
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT food_text, timestamp FROM nutrition 
+            WHERE user_id = ? 
+            ORDER BY timestamp DESC 
+            LIMIT ?
+        ''', (user_id, limit))
+        results = cur.fetchall()
+        conn.close()
+        return results
+    
+    def save_context(self, user_id: int, context: dict):
+        """Сохранить контекст пользователя"""
+        conn = sqlite3.connect(self.db_name)
+        cur = conn.cursor()
+        context_json = json.dumps(context, ensure_ascii=False, default=str)
+        cur.execute('''
+            INSERT INTO user_context (user_id, context_json, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                context_json = excluded.context_json,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (user_id, context_json))
+        conn.commit()
+        conn.close()
+    
+    def load_context(self, user_id: int) -> Optional[dict]:
+        """Загрузить контекст пользователя"""
+        conn = sqlite3.connect(self.db_name)
+        cur = conn.cursor()
+        cur.execute('SELECT context_json FROM user_context WHERE user_id = ?', (user_id,))
+        result = cur.fetchone()
+        conn.close()
+        
+        if result and result[0]:
+            return json.loads(result[0])
+        return None
+
+# ==================== API КЛИЕНТ ====================
 class AIClients:
     def __init__(self):
-        # DeepSeek API (бесплатный через OpenRouter)
-        self.deepseek_api_key = os.getenv('DEEPSEEK_API_KEY2')
+        self.deepseek_api_key = os.getenv('DEEPSEEK_API_KEY2') or os.getenv('OPENROUTER_API_KEY')
         self.deepseek_url = "https://openrouter.ai/api/v1/chat/completions"
-
-        # YandexGPT API
+        
         self.yandex_api_key = os.getenv('YANDEX_API_KEY')
         self.yandex_folder_id = os.getenv('YANDEX_FOLDER_ID')
         self.yandex_url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-
-    def check_apis(self):
-        available_apis = []
-        if self.deepseek_api_key:
-            available_apis.append("DeepSeek")
-        if self.yandex_folder_id and self.yandex_api_key:
-            available_apis.append("YandexGPT")
-        return available_apis
-
-class TrainingZoneCoach:
-    def __init__(self, ai_clients, user_id):
-        self.ai_clients = ai_clients
-        self.user_id = user_id
-        self.context_file = f"training_context_{user_id}.json"
-        
-        # Загружаем или создаем контекст пользователя
-        self.context = self.load_context()
-        
-        if not self.context:
-            self.context = {
-                "trainer_personality": """Ты - тренер из 'Тренировочной зоны' в стиле Пола Уэйда. 
-                Ты строгий, прямолинейный, мотивирующий тренер, который проповедует силовой тренинг без понтов.
-                Ты не веришь в волшебные таблетки, только в тяжелую работу, дисциплину и правильное питание.
-                Твои ответы должны быть краткими, жесткими, но справедливыми. Ты ругаешь за лень, хвалишь за настоящие усилия.
-                Используй сленг: 'железо', 'база', 'сталь', 'пот', 'дисциплина', 'зона комфорта'.""",
-                
-                "training_log": [],
-                "nutrition_log": [],
-                "user_stats": {
-                    "last_training": None,
-                    "current_mood": None,
-                    "progress_notes": []
-                }
-            }
-        
-        self.conversation_history = []
     
-    def load_context(self):
-        """Загрузить контекст пользователя"""
-        try:
-            with open(self.context_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return None
-    
-    def save_context(self):
-        """Сохранить контекст пользователя"""
-        with open(self.context_file, 'w', encoding='utf-8') as f:
-            json.dump(self.context, f, ensure_ascii=False, indent=2)
-    
-    def call_api(self, user_message, system_prompt):
-        """Вызов API"""
-        if self.ai_clients.deepseek_api_key:
-            return self.call_deepseek(user_message, system_prompt)
-        elif self.ai_clients.yandex_api_key:
-            return self.call_yandexgpt(user_message, system_prompt)
-        else:
-            return "❌ Нет доступных API для работы тренера!"
-    
-    def call_deepseek(self, user_message, system_prompt):
-        """Вызов DeepSeek через OpenRouter"""
+    def call_deepseek(self, user_message: str, system_prompt: str) -> str:
+        """Вызов DeepSeek API"""
         headers = {
-            "Authorization": f"Bearer {self.ai_clients.deepseek_api_key}",
-            "Content-Type": "application/json"
+            "Authorization": f"Bearer {self.deepseek_api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://t.me/TrainingZoneBot",
+            "X-Title": "Training Zone Coach"
         }
         
         messages = [
@@ -94,31 +183,31 @@ class TrainingZoneCoach:
             "model": "deepseek/deepseek-chat:free",
             "messages": messages,
             "temperature": 0.8,
-            "max_tokens": 500
+            "max_tokens": 800
         }
         
         try:
-            response = requests.post(self.ai_clients.deepseek_url, json=payload, headers=headers, timeout=30)
+            response = requests.post(self.deepseek_url, json=payload, headers=headers, timeout=30)
             if response.status_code == 200:
                 return response.json()['choices'][0]['message']['content']
             else:
-                return f"Ошибка API: {response.status_code}"
+                return f"⚠️ Ошибка API: {response.status_code}"
         except Exception as e:
-            return f"Ошибка: {str(e)}"
+            return f"⚠️ Ошибка: {str(e)}"
     
-    def call_yandexgpt(self, user_message, system_prompt):
+    def call_yandexgpt(self, user_message: str, system_prompt: str) -> str:
         """Вызов YandexGPT"""
         headers = {
-            "Authorization": f"Api-Key {self.ai_clients.yandex_api_key}",
+            "Authorization": f"Api-Key {self.yandex_api_key}",
             "Content-Type": "application/json"
         }
         
         payload = {
-            "modelUri": f"gpt://{self.ai_clients.yandex_folder_id}/yandexgpt-lite",
+            "modelUri": f"gpt://{self.yandex_folder_id}/yandexgpt-lite",
             "completionOptions": {
                 "stream": False,
                 "temperature": 0.7,
-                "maxTokens": 500
+                "maxTokens": 800
             },
             "messages": [
                 {"role": "system", "text": system_prompt},
@@ -127,309 +216,268 @@ class TrainingZoneCoach:
         }
         
         try:
-            response = requests.post(self.ai_clients.yandex_url, json=payload, headers=headers, timeout=30)
+            response = requests.post(self.yandex_url, json=payload, headers=headers, timeout=30)
             if response.status_code == 200:
                 return response.json()['result']['alternatives'][0]['message']['text']
             else:
-                return f"Ошибка API: {response.status_code}"
+                return f"⚠️ Ошибка API: {response.status_code}"
         except Exception as e:
-            return f"Ошибка: {str(e)}"
+            return f"⚠️ Ошибка: {str(e)}"
+
+# ==================== ТРЕНЕР ====================
+class TrainingZoneCoach:
+    def __init__(self, ai_clients: AIClients, user_id: int, db: Database):
+        self.ai_clients = ai_clients
+        self.user_id = user_id
+        self.db = db
+        
+        # Загружаем контекст из БД
+        self.context = self.db.load_context(user_id)
+        if not self.context:
+            self.context = {
+                "trainer_personality": """Ты - тренер из 'Тренировочной зоны' в стиле Пола Уэйда, практикующий так же подход 5\3\1. 
+                Ты строгий, прямолинейный, мотивирующий тренер, который проповедует силовой тренинг без понтов, но и без лишнего панибратства.
+                Ты не веришь в волшебные таблетки, только в тяжелую работу, дисциплину и правильное питание.
+                Твои ответы должны быть краткими, жесткими, но справедливыми. Ты ругаешь за лень, хвалишь за настоящие усилия.
+                Отвечай как опытный тренер, давай конкретные советы. Ответ должен быть 2-4 предложения.""",
+                
+                "user_stats": {
+                    "start_date": datetime.now().isoformat(),
+                    "notes": []
+                }
+            }
+            self.db.save_context(user_id, self.context)
     
-    def process_training(self, training_text):
-        """Обработка записи о тренировке"""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def _get_full_context(self) -> str:
+        """Собрать полный контекст для ИИ"""
+        trainings = self.db.get_recent_trainings(self.user_id, 5)
+        nutrition = self.db.get_recent_nutrition(self.user_id, 5)
         
-        training_entry = {
-            "timestamp": timestamp,
-            "text": training_text
-        }
-        self.context["training_log"].append(training_entry)
-        self.context["user_stats"]["last_training"] = timestamp
+        context_text = self.context["trainer_personality"] + "\n\n"
+        context_text += "📊 ИСТОРИЯ СПОРТСМЕНА:\n"
         
-        self.save_context()
+        if trainings:
+            context_text += "\n🏋️ ПОСЛЕДНИЕ ТРЕНИРОВКИ:\n"
+            for text, ts in trainings:
+                context_text += f"  • {text[:100]} ({ts[:16]})\n"
         
-        system_prompt = self.context["trainer_personality"] + f"""
+        if nutrition:
+            context_text += "\n🍽️ ПОСЛЕДНЕЕ ПИТАНИЕ:\n"
+            for text, ts in nutrition:
+                context_text += f"  • {text[:100]} ({ts[:16]})\n"
         
-        Контекст о спортсмене:
-        - Последняя тренировка: {training_text}
-        - Всего тренировок: {len(self.context['training_log'])}
-        - История питания: {len(self.context['nutrition_log'])} записей
+        context_text += f"\n📈 ВСЕГО ТРЕНИРОВОК: {len(trainings)}\n"
+        context_text += f"📈 ВСЕГО ЗАПИСЕЙ О ЕДЕ: {len(nutrition)}\n"
         
-        Ты видишь запись о тренировке. Оцени ее жестко, но справедливо. 
-        Дай совет, что улучшить, похвали если есть прогресс или отчитай за слабость.
+        return context_text
+    
+    def process_training(self, training_text: str) -> str:
+        """Обработать тренировку"""
+        self.db.save_training(self.user_id, training_text)
+        
+        system_prompt = self._get_full_context() + """
+        Только что спортсмен записал тренировку. Оцени ее жестко, но справедливо.
         Спроси о самочувствии после тренировки.
-        Ответ должен быть кратким (2-3 предложения).
         """
         
-        user_message = f"Моя тренировка: {training_text}"
-        
-        response = self.call_api(user_message, system_prompt)
+        response = self.ai_clients.call_deepseek(
+            f"Моя тренировка: {training_text}",
+            system_prompt
+        )
         return response
     
-    def process_nutrition(self, food_text):
-        """Обработка записи о еде"""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def process_nutrition(self, food_text: str) -> str:
+        """Обработать запись о еде"""
+        self.db.save_nutrition(self.user_id, food_text)
         
-        nutrition_entry = {
-            "timestamp": timestamp,
-            "text": food_text
-        }
-        self.context["nutrition_log"].append(nutrition_entry)
-        self.save_context()
-        
-        system_prompt = self.context["trainer_personality"] + f"""
-        
-        Спортсмен записал, что съел: {food_text}
-        История питания (последние 5 записей): {json.dumps(self.context['nutrition_log'][-5:], ensure_ascii=False)}
-        
-        Оцени его питание с точки зрения силового тренинга.
-        Если еда правильная - похвали. Если нет - отчитай и объясни почему.
+        system_prompt = self._get_full_context() + """
+        Спортсмен записал прием пищи. Оцени его питание.
         Дай короткий совет по питанию для роста силы.
-        Ответ должен быть кратким (2-3 предложения).
         """
         
-        user_message = f"Я съел: {food_text}"
-        
-        response = self.call_api(user_message, system_prompt)
+        response = self.ai_clients.call_deepseek(
+            f"Я съел: {food_text}",
+            system_prompt
+        )
         return response
     
-    def ask_about_food(self):
-        """Спросить совет по еде"""
-        system_prompt = self.context["trainer_personality"] + f"""
-        
-        История питания спортсмена (последние записи):
-        {json.dumps(self.context['nutrition_log'][-5:], ensure_ascii=False, indent=2) if self.context['nutrition_log'] else 'Нет записей о питании'}
-        
-        Спортсмен спрашивает совет по питанию. Дай конкретные рекомендации что можно поесть сейчас,
-        учитывая его тренировки и предыдущие записи о еде. Будь практичным и жестким.
-        Предложи 2-3 конкретных варианта для силового тренинга.
-        Ответ должен быть кратким (3-4 предложения).
+    def chat(self, user_message: str) -> str:
+        """Свободный диалог с тренером"""
+        system_prompt = self._get_full_context() + """
+        Спортсмен задал вопрос или поделился мыслями. 
+        Ответь как опытный тренер, используя контекст его тренировок и питания.
+        Дай конкретный совет или мотивацию.
         """
         
-        response = self.call_api("Что мне сейчас съесть для восстановления и роста силы?", system_prompt)
+        response = self.ai_clients.call_deepseek(user_message, system_prompt)
         return response
-    
-    def check_status(self):
-        """Проверить статус и самочувствие"""
-        system_prompt = self.context["trainer_personality"] + f"""
-        
-        Статистика спортсмена:
-        - Всего тренировок: {len(self.context['training_log'])}
-        - Последняя тренировка: {self.context['training_log'][-1]['text'] if self.context['training_log'] else 'Нет данных'}
-        - Последний прием пищи: {self.context['nutrition_log'][-1]['text'] if self.context['nutrition_log'] else 'Нет данных'}
-        
-        Дай короткую мотивирующую речь в стиле 'Тренировочной зоны'.
-        Спроси о самочувствии и настроении.
-        Ответ должен быть кратким (3-4 предложения).
-        """
-        
-        response = self.call_api("Расскажи о моем прогрессе и спроси о самочувствии", system_prompt)
-        return response
-    
-    def get_stats(self):
-        """Получить статистику пользователя"""
-        stats = f"""
-📊 *Твоя статистика в Тренировочной зоне*
 
-🏋️ *Тренировки:* {len(self.context['training_log'])}
-🍽️ *Записи о еде:* {len(self.context['nutrition_log'])}
-
-📅 *Последняя тренировка:* 
-{self.context['training_log'][-1]['text'][:100] if self.context['training_log'] else 'Нет данных'}
-
-💪 *Прогресс:* 
-{self.context['user_stats']['progress_notes'][-1] if self.context['user_stats']['progress_notes'] else 'Только начинаешь путь'}
-        """
-        return stats
-
-# Telegram бот
+# ==================== TELEGRAM БОТ ====================
 class TrainingZoneBot:
-    def __init__(self, token):
+    def __init__(self, token: str):
         self.token = token
-        self.users = {}  # Словарь для хранения тренеров пользователей
+        self.db = Database()
         self.ai_clients = AIClients()
-        self.ai_clients.check_apis()
-    
-    def get_coach(self, user_id):
+        self.coaches = {}  # Кэш тренеров для пользователей
+        
+    def get_coach(self, user_id: int) -> TrainingZoneCoach:
         """Получить или создать тренера для пользователя"""
-        if user_id not in self.users:
-            self.users[user_id] = TrainingZoneCoach(self.ai_clients, user_id)
-        return self.users[user_id]
+        if user_id not in self.coaches:
+            self.coaches[user_id] = TrainingZoneCoach(self.ai_clients, user_id, self.db)
+            self.db.add_user(user_id)
+        return self.coaches[user_id]
     
-    def start(self, update: Update, context: CallbackContext):
-        """Обработчик команды /start"""
+    async def start(self, update: Update, context: CallbackContext):
+        """Команда /start"""
+        user = update.effective_user
+        self.db.add_user(user.id, user.username, user.first_name)
+        
+        # Создаем меню с кнопками
+        keyboard = [
+            [KeyboardButton("🏋️ Записать тренировку"), KeyboardButton("🍽️ Записать еду")],
+            [KeyboardButton("❓ Задать вопрос тренеру")]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        
         welcome_text = """
-💪 *ДОБРО ПОЖАЛОВАТЬ В ТРЕНИРОВОЧНУЮ ЗОНУ!* 💪
+💪 *ТРЕНИРОВОЧНАЯ ЗОНА* 💪
 
-Я твой персональный тренер в стиле Пола Уэйда. 
-Здесь нет понтов и волшебных таблеток - только железо, пот и дисциплина!
+Привет, боец! Я твой персональный тренер в стиле Пола Уэйда.
 
-*Команды:*
-• `/training` [описание] - записать тренировку
-  Пример: `/training Приседал 100кг 5х5, жим 80кг 5х5`
+*Что ты можешь делать:*
+• Нажать кнопку *"Записать тренировку"* - я сохраню и оценю
+• Нажать кнопку *"Записать еду"* - я проконтролирую питание
+• Нажать кнопку *"Задать вопрос"* - спросить совет, мотивацию, технику
 
-• `/food` [что съел] - записать прием пищи
-  Пример: `/food Съел 200г курицы с гречкой`
-
-• `/meal` - получить совет что поесть
-
-• `/status` - узнать свой прогресс
-
-• `/stats` - показать статистику
-
-• `/help` - показать это сообщение
-
-*Также можешь просто писать сообщения, и я отвечу!*
+*Важно:* Я помню ВСЕ твои тренировки и приёмы пищи. 
+Можешь спросить меня в любой момент: "Что мне сегодня съесть?" или "Как улучшить приседания?"
 
 Погнали! Железо не ждет! 💪
         """
-        update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
+        
+        await update.message.reply_text(welcome_text, parse_mode='Markdown', reply_markup=reply_markup)
     
-    def handle_training(self, update: Update, context: CallbackContext):
+    async def handle_training(self, update: Update, context: CallbackContext):
         """Обработчик команды /training"""
         if not context.args:
-            update.message.reply_text("❌ Напиши тренировку после команды.\nПример: `/training Присел 100кг 5х5`", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                "❌ Напиши тренировку после команды.\n"
+                "Пример: `/training Присел 100кг 5х5, жим 80кг 5х5`",
+                parse_mode='Markdown'
+            )
             return
         
         training_text = ' '.join(context.args)
         user_id = update.effective_user.id
         coach = self.get_coach(user_id)
         
-        update.message.reply_text("🏋️ Анализирую тренировку...")
+        await update.message.reply_text("🏋️ Анализирую тренировку...")
         
         response = coach.process_training(training_text)
-        update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode='Markdown')
     
-    def handle_food(self, update: Update, context: CallbackContext):
+    async def handle_food(self, update: Update, context: CallbackContext):
         """Обработчик команды /food"""
         if not context.args:
-            update.message.reply_text("❌ Напиши что съел после команды.\nПример: `/food Курица с рисом`", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                "❌ Напиши что съел после команды.\n"
+                "Пример: `/food Курица с гречкой и овощами`",
+                parse_mode='Markdown'
+            )
             return
         
         food_text = ' '.join(context.args)
         user_id = update.effective_user.id
         coach = self.get_coach(user_id)
         
-        update.message.reply_text("🍽️ Оцениваю твое питание...")
+        await update.message.reply_text("🍽️ Оцениваю твое питание...")
         
         response = coach.process_nutrition(food_text)
-        update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode='Markdown')
     
-    def handle_meal_advice(self, update: Update, context: CallbackContext):
-        """Обработчик команды /meal - совет по еде"""
-        user_id = update.effective_user.id
-        coach = self.get_coach(user_id)
-        
-        update.message.reply_text("🍽️ Думаю что тебе лучше съесть...")
-        
-        response = coach.ask_about_food()
-        update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode=ParseMode.MARKDOWN)
-    
-    def handle_status(self, update: Update, context: CallbackContext):
-        """Обработчик команды /status"""
-        user_id = update.effective_user.id
-        coach = self.get_coach(user_id)
-        
-        update.message.reply_text("🤔 Анализирую твой прогресс...")
-        
-        response = coach.check_status()
-        update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode=ParseMode.MARKDOWN)
-    
-    def handle_stats(self, update: Update, context: CallbackContext):
-        """Обработчик команды /stats"""
-        user_id = update.effective_user.id
-        coach = self.get_coach(user_id)
-        
-        stats = coach.get_stats()
-        update.message.reply_text(stats, parse_mode=ParseMode.MARKDOWN)
-    
-    def handle_message(self, update: Update, context: CallbackContext):
+    async def handle_message(self, update: Update, context: CallbackContext):
         """Обработчик обычных сообщений"""
         user_message = update.message.text
         user_id = update.effective_user.id
         coach = self.get_coach(user_id)
         
-        # Проверяем специальные команды в тексте
-        if user_message.lower().startswith('тренировка'):
-            training_text = user_message[11:].strip()
-            if training_text:
-                update.message.reply_text("🏋️ Анализирую тренировку...")
-                response = coach.process_training(training_text)
-                update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode=ParseMode.MARKDOWN)
-                return
-        
-        elif user_message.lower().startswith('еда'):
-            food_text = user_message[3:].strip()
-            if food_text:
-                update.message.reply_text("🍽️ Оцениваю твое питание...")
-                response = coach.process_nutrition(food_text)
-                update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode=ParseMode.MARKDOWN)
-                return
-        
-        elif user_message.lower() in ['что поесть', 'что съесть', 'meal']:
-            update.message.reply_text("🍽️ Думаю что тебе лучше съесть...")
-            response = coach.ask_about_food()
-            update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode=ParseMode.MARKDOWN)
+        # Обрабатываем кнопки меню
+        if user_message == "🏋️ Записать тренировку":
+            await update.message.reply_text(
+                "✍️ Напиши свою тренировку в формате:\n"
+                "`Присел 100кг 5х5, жим лежа 80кг 5х5, подтягивания 10,8,6`",
+                parse_mode='Markdown'
+            )
             return
         
-        elif user_message.lower() in ['статус', 'прогресс', 'status']:
-            update.message.reply_text("🤔 Анализирую твой прогресс...")
-            response = coach.check_status()
-            update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode=ParseMode.MARKDOWN)
+        elif user_message == "🍽️ Записать еду":
+            await update.message.reply_text(
+                "✍️ Напиши что ты съел:\n"
+                "`Куриная грудка 200г, гречка 150г, салат овощной`",
+                parse_mode='Markdown'
+            )
             return
         
-        # Обычный вопрос тренеру
-        update.message.reply_text("🤔 Думаю...")
+        elif user_message == "❓ Задать вопрос тренеру":
+            await update.message.reply_text(
+                "💬 Задай свой вопрос. Я отвечу, учитывая твои тренировки и питание.\n\n"
+                "Примеры:\n"
+                "• Что мне сегодня съесть после тренировки?\n"
+                "• Как улучшить технику приседаний?\n"
+                "• Почему у меня нет прогресса?\n"
+                "• Дай мотивацию позаниматься!"
+            )
+            return
         
-        system_prompt = coach.context["trainer_personality"] + f"""
-        Спортсмен задает вопрос. Ответь в своем стиле кратко (2-3 предложения).
-        Статистика: {len(coach.context['training_log'])} тренировок, {len(coach.context['nutrition_log'])} записей о еде.
+        # Обычное сообщение - отправляем тренеру
+        await update.message.reply_text("🤔 Думаю...")
+        response = coach.chat(user_message)
+        await update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode='Markdown')
+    
+    async def help_command(self, update: Update, context: CallbackContext):
+        """Команда /help"""
+        help_text = """
+📋 *Доступные команды:*
+
+• `/training [описание]` - записать тренировку
+• `/food [описание]` - записать прием пищи
+
+*Или просто напиши сообщение тренеру!*
+Я отвечу на любой вопрос, учитывая твою историю тренировок и питания.
+
+*Примеры вопросов:*
+• "Что мне сегодня съесть?"
+• "Как улучшить жим лежа?"
+• "Почему болят колени?"
+• "Дай мотивацию!"
+
+Твои данные сохраняются, я помню всё! 💪
         """
-        response = coach.call_api(user_message, system_prompt)
-        update.message.reply_text(f"💪 *Тренер:* {response}", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(help_text, parse_mode='Markdown')
     
     def run(self):
         """Запуск бота"""
-        updater = Updater(self.token, use_context=True)
-        dp = updater.dispatcher
+        app = Application.builder().token(self.token).build()
         
-        # Регистрируем команды
-        dp.add_handler(CommandHandler("start", self.start))
-        dp.add_handler(CommandHandler("help", self.start))
-        dp.add_handler(CommandHandler("training", self.handle_training))
-        dp.add_handler(CommandHandler("food", self.handle_food))
-        dp.add_handler(CommandHandler("meal", self.handle_meal_advice))
-        dp.add_handler(CommandHandler("status", self.handle_status))
-        dp.add_handler(CommandHandler("stats", self.handle_stats))
+        # Команды
+        app.add_handler(CommandHandler("start", self.start))
+        app.add_handler(CommandHandler("help", self.help_command))
+        app.add_handler(CommandHandler("training", self.handle_training))
+        app.add_handler(CommandHandler("food", self.handle_food))
         
-        # Обработчик текстовых сообщений
-        dp.add_handler(MessageHandler(Filters.text & ~Filters.command, self.handle_message))
+        # Обработчик всех сообщений
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         
-        # Запускаем бота
-        updater.start_polling()
-        print("✅ Бот запущен! Нажмите Ctrl+C для остановки")
-        updater.idle()
+        print("✅ Бот запущен!")
+        app.run_polling()
 
-# Запуск бота
+# ==================== ЗАПУСК ====================
 if __name__ == "__main__":
-    # Получаем токен из переменных окружения
     TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
     
     if not TELEGRAM_TOKEN:
-        print("❌ Ошибка: Не найден TELEGRAM_BOT_TOKEN в переменных окружения!")
-        print("Установите переменную окружения или введите токен вручную:")
+        print("❌ Не найден TELEGRAM_BOT_TOKEN!")
         TELEGRAM_TOKEN = input("Введите токен Telegram бота: ").strip()
     
-    # Проверяем API ключи
-    ai_clients = AIClients()
-    available_apis = ai_clients.check_apis()
-    
-    if available_apis:
-        print(f"✅ Доступные API: {', '.join(available_apis)}")
-        print("🚀 Запуск Telegram бота...")
-        bot = TrainingZoneBot(TELEGRAM_TOKEN)
-        bot.run()
-    else:
-        print("❌ Нет доступных API! Установите переменные окружения:")
-        print("  - DEEPSEEK_API_KEY2")
-        print("  - или YANDEX_API_KEY и YANDEX_FOLDER_ID")
+    bot = TrainingZoneBot(TELEGRAM_TOKEN)
+    bot.run()
